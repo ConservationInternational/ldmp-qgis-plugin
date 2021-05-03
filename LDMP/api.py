@@ -17,32 +17,132 @@ standard_library.install_aliases()
 from builtins import object
 import sys
 import time
+import json
 from datetime import datetime
 from dateutil import tz
 import requests
 import json
 from urllib.parse import quote_plus
 
+import marshmallow
 from qgis.PyQt.QtCore import QCoreApplication, QSettings, QEventLoop
 from qgis.PyQt.QtWidgets import QMessageBox
 
 from qgis.utils import iface
+from qgis.core import (
+    QgsAuthMethodConfig,
+    QgsApplication
+)
 
 from LDMP.worker import AbstractWorker, start_worker
 
 from LDMP import log, debug_on
+from LDMP.message_bar import MessageBar
 
 API_URL = 'https://api.trends.earth'
 TIMEOUT = 20
-
+AUTH_CONFIG_NAME = 'Trends.Earth'
 
 class tr_api(object):
     def tr(message):
         return QCoreApplication.translate("tr_api", message)
 
+def init_auth_config(email=None):
+    currentAuthConfig = None
+
+    # check if an auth method with name AUTH_CONFIG_NAME was already set
+    configs = QgsApplication.authManager().availableAuthMethodConfigs()
+    previousAuthExist = False
+    for config in configs.values():
+        if config.name() == AUTH_CONFIG_NAME:
+            currentAuthConfig = config
+            previousAuthExist = True
+            break
+
+    if not previousAuthExist:
+        # not found => craete a new one
+        currentAuthConfig = QgsAuthMethodConfig()
+        currentAuthConfig.setName(AUTH_CONFIG_NAME)
+
+    # reset it's config values to set later new password when received
+    currentAuthConfig.setMethod('Basic')
+    currentAuthConfig.setUri(API_URL + '/auth')
+    currentAuthConfig.setConfig('username', email)
+    currentAuthConfig.setConfig('password', None)
+    currentAuthConfig.setConfig('realm', None)
+
+    if not previousAuthExist:
+        # store a new auth config
+        if not QgsApplication.authManager().storeAuthenticationConfig(currentAuthConfig):
+            MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('Cannot init auth configuration'))
+            return None
+    else:
+        # update existing
+         if not QgsApplication.authManager().updateAuthenticationConfig(currentAuthConfig):
+            MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('Cannot update auth configuration'))
+            return None
+
+    QSettings().setValue("trends_earth/authId", currentAuthConfig.id())
+    return currentAuthConfig.id()
+
+def remove_current_auth_config():
+    authConfigId = QSettings().value("trends_earth/authId", None)
+    if not authConfigId:
+        MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('No authentication set. Do it in Trends.Earth settings'))
+        return None
+    log('remove_current_auth_config with authId {}'.format(authConfigId))
+
+    if not QgsApplication.authManager().removeAuthenticationConfig( authConfigId ):
+        MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('Cannot remove auth configuration with id: {}').format(authConfigId))
+        return False
+
+    QSettings().setValue("trends_earth/authId", None)
+    return True
+
+def get_auth_config(authConfigId=None, warn=True):
+    if not authConfigId:
+        # not set? then retrieve from config if set
+        authConfigId = QSettings().value("trends_earth/authId", None)
+        if not authConfigId:
+            if warn:
+                MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('No authentication set. Do it in Trends.Earth settings'))
+            return None
+    log('get_auth_config with authId {}'.format(authConfigId))
+
+    configs = QgsApplication.authManager().availableAuthMethodConfigs()
+    if not authConfigId in configs.keys():
+        if warn:
+            MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('Cannot retrieve credentials with authId: {} setup correct credentials before').format(authConfigId))
+        return None
+
+    authConfig = QgsAuthMethodConfig()
+    ok = QgsApplication.authManager().loadAuthenticationConfig(authConfigId, authConfig, True)
+    if not ok:
+        if warn:
+            MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('Cannot retrieve credentials with authId: {} setup correct credentials before').format(authConfigId))
+        return None
+    
+    if not authConfig.isValid():
+        if warn:
+            MessageBar().get().pushCritical('Trends.Earth', tr_api.tr('Not valid auth configuration with authId: {}').format(authConfigId))
+        return None
+
+    # check if auth method is the only supported for no
+    if authConfig.method() != 'Basic':
+        if warn:
+            MessageBar().get().pushCritical('Trends.Earth',
+                tr_api.tr('Auth method with authId: {} is {}. Only basic auth is supported by Trend.Earth').format( authConfigId, authConfig.method() ))
+        return None
+    
+    return authConfig
 
 def get_user_email(warn=True):
-    email = QSettings().value("LDMP/email", None)
+    # get mail from authConfig
+    authConfig = get_auth_config(warn=warn)
+    if not authConfig:
+        return None
+
+    email = authConfig.config('username')
     if warn and email is None:
         QMessageBox.critical(None, tr_api.tr("Error"), tr_api.tr( "Please register with Trends.Earth before using this function."))
         return None
@@ -170,23 +270,29 @@ def get_error_status(resp):
     return (desc, status)
 
 
-def login(email=None, password=None):
-    if (email == None):
-        email = get_user_email()
-    if (password == None):
-        password = QSettings().value("LDMP/password", None)
-    if not email or not password:
-        log('API unable to login - check username/password')
+def login(authConfigId=None):
+    authConfig = get_auth_config(authConfigId=authConfigId)
+    if not authConfig :
+        log('API unable to login - setup auth configuration before')
         QMessageBox.critical(None,
-                                   tr_api.tr("Error"),
-                                   tr_api.tr("Unable to login to Trends.Earth. Check your username and password."))
+                            tr_api.tr("Error"),
+                            tr_api.tr("Unable to login to Trends.Earth. Setup auth configuration before."))
+        return None
+
+    email = authConfig.config('username')
+    password = authConfig.config('password')
+
+    if not email or not password:
+        log('API unable to login - set username/password in auth config with id: {}'.format(authConfig.id()))
+        QMessageBox.critical(None,
+                            tr_api.tr("Error"),
+                            tr_api.tr("Unable to login to Trends.Earth. Set your username and password in auth config: '{}'".format(authConfig.name())) )
         return None
 
     resp = call_api('/auth', method='post', payload={"email": email, "password": password})
 
     if resp != None:
-        QSettings().setValue("LDMP/email", email)
-        QSettings().setValue("LDMP/password", password)
+        QSettings().setValue("trends_earth/authId", authConfig.id())
 
     return resp
 
@@ -300,12 +406,54 @@ def register(email, name, organization, country):
     return call_api('/api/v1/user', method='post', payload=payload)
 
 
-def run_script(script, params={}):
+def run_script(script_metadata, params={}):
     # TODO: check before submission whether this payload and script ID has
     # been sent recently - or even whether there are results already
     # available for it. Notify the user if this is the case to prevent, or
     # at least reduce, repeated identical submissions.
-    return call_api(u'/api/v1/script/{}/run'.format(quote_plus(script)), 'post', params, use_token=True)
+    script_name = script_metadata[0]
+    script_slug = script_metadata[1]
+
+    # run a script needs the following steps
+    # 1st step) run it
+    resp = call_api(u'/api/v1/script/{}/run'.format(quote_plus(script_slug)), 'post', params, use_token=True)
+
+    # 2nd step) save returned processing data as json file as process placeholder
+    if resp:
+        # data = resp['data']
+        # only a job should be available as response
+        # if len(data) != 1:
+        #     QMessageBox.critical(None, "Error", tr_api.tr(u"More than one jobs returned running script. Only newest will be get as run representative"))
+        # data = sorted(data, key=lambda job_dict: round(datetime.strptime(job_dict['start_date'], '%Y-%m-%dT%H:%M:%S.%f').timestamp()), reverse=True)
+        job_dict = resp['data']
+
+        # Convert start/end dates into datatime objects in local time zone
+        # the reason is to allog parsin using JobSchema based on APIResponseSchema
+        start_date = datetime.strptime(job_dict['start_date'], '%Y-%m-%dT%H:%M:%S.%f')
+        start_date = start_date.replace(tzinfo=tz.tzutc())
+        start_date = start_date.astimezone(tz.tzlocal())
+        # job_dict['start_date'] = datetime.strftime(start_date, '%Y/%m/%d (%H:%M)')
+        job_dict['start_date'] = start_date
+        end_date = job_dict.get('end_date', None)
+        if end_date:
+            end_date = datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%f')
+            end_date = end_date.replace(tzinfo=tz.tzutc())
+            end_date = end_date.astimezone(tz.tzlocal())
+            # job_dict['end_date'] = datetime.strftime(end_date, '%Y/%m/%d (%H:%M)')
+            job_dict['end_date'] = end_date
+        job_dict['task_name'] = job_dict['params'].get('task_name', '')
+        job_dict['task_notes'] = job_dict['params'].get('task_notes', '')
+        job_dict['params'] = job_dict['params']
+        job_dict['script'] = {"name": script_name, "slug": script_slug}
+
+        # do import here to avoid circular import
+        from LDMP.jobs import Jobs
+        from LDMP.models.datasets import Datasets
+        jobFileName, job = Jobs().append(job_dict)
+        Datasets().appendFromJob(job)
+        Datasets().updated.emit()
+
+    return resp
 
 
 def update_user(email, name, organization, country):
@@ -337,19 +485,23 @@ def get_execution(id=None, date=None):
     if not resp:
         return None
     else:
+        # do import here to avoid circular import
+        from LDMP.jobs import Job, JobSchema
+
         data = resp['data']
         # Sort responses in descending order using start time by default
-        data = sorted(data, key=lambda job: job['start_date'], reverse=True)
+        data = sorted(data, key=lambda job_dict: round(datetime.strptime(job_dict['start_date'], '%Y-%m-%dT%H:%M:%S.%f').timestamp()), reverse=True)
         # Convert start/end dates into datatime objects in local time zone
-        for job in data:
-            start_date = datetime.strptime(job['start_date'], '%Y-%m-%dT%H:%M:%S.%f')
+        for job_dict in data:
+            start_date = datetime.strptime(job_dict['start_date'], '%Y-%m-%dT%H:%M:%S.%f')
             start_date = start_date.replace(tzinfo=tz.tzutc())
             start_date = start_date.astimezone(tz.tzlocal())
-            job['start_date'] = start_date
-            end_date = datetime.strptime(job['end_date'], '%Y-%m-%dT%H:%M:%S.%f')
+            job_dict['start_date'] = start_date
+            end_date = datetime.strptime(job_dict['end_date'], '%Y-%m-%dT%H:%M:%S.%f')
             end_date = end_date.replace(tzinfo=tz.tzutc())
             end_date = end_date.astimezone(tz.tzlocal())
-            job['end_date'] = end_date
+            job_dict['end_date'] = end_date
+
         return data
 
 

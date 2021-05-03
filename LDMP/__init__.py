@@ -17,6 +17,8 @@ import os
 import re
 import site
 import json
+import subprocess
+import datetime
 from tempfile import NamedTemporaryFile
 
 from qgis.PyQt.QtCore import (QSettings, QTranslator, qVersion, 
@@ -35,13 +37,16 @@ __revision__ = version_info['revision']
 __release_date__ = version_info['release_date']
 
 
+def tr(message):
+    return QCoreApplication.translate('trends.earth', message)
+
+
 def log(message, level=0):
-    QgsMessageLog.logMessage(message, tag="trends.earth", level=level)
+    QgsMessageLog.logMessage(message, tag='trends.earth', level=level)
 
 
 def classFactory(iface):  # pylint: disable=invalid-name
     """Load LDMPPlugin class from file LDMP.
-
     :param iface: A QGIS interface instance.
     :type iface: QgsInterface
     """
@@ -88,21 +93,61 @@ def binaries_available():
     ret = True
     try:
         from trends_earth_binaries import summary_numba
-        if QSettings().value("LDMP/debug", False):
+        if QSettings().value("LDMP/debug", False, type=bool):
             log("Numba-compiled version of summary_numba available.")
     except (ModuleNotFoundError, ImportError) as e:
-        if QSettings().value("LDMP/debug", False):
+        if QSettings().value("LDMP/debug", False, type=bool):
             log("Numba-compiled version of summary_numba not available.")
         ret = False
     try:
         from trends_earth_binaries import calculate_numba
-        if QSettings().value("LDMP/debug", False):
+        if QSettings().value("LDMP/debug", False, type=bool):
             log("Numba-compiled version of calculate_numba available.")
     except (ModuleNotFoundError, ImportError) as e:
-        if QSettings().value("LDMP/debug", False):
+        if QSettings().value("LDMP/debug", False, type=bool):
             log("Numba-compiled version of calculate_numba not available.")
         ret = False
     return ret
 
 def debug_on():
-    QSettings().value("LDMP/debug", False) == 'True'
+    QSettings().value("LDMP/debug", False, type=bool)
+
+
+def openFolder(path):
+    if not path:
+        return
+
+    # check path exist and readable
+    if not os.path.exists(path):
+        message = tr('Path do not exist: ') + path
+        iface.messageBar().pushCritical('Trends.Earth', message)
+        return
+
+    if not os.access(path, mode=os.R_OK|os.W_OK):
+        message = tr('No read or write permission on path: ') + path
+        iface.messageBar().pushCritical('Trends.Earth', message)
+        return
+
+    if sys.platform == 'darwin':
+        subprocess.check_call(['open', path])
+    elif sys.platform == 'linux':
+        subprocess.check_call(['xdg-open', path])
+    elif sys.platform == 'win32':
+        subprocess.check_call(['explorer', path])
+
+# singleton decorator
+def singleton(cls):
+    instances = {}
+    def wrapper(*args, **kwargs):
+        if cls not in instances:
+          instances[cls] = cls(*args, **kwargs)
+        return instances[cls]
+    return wrapper
+
+
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    raise TypeError("Type {} not serializable".format(type(obj)))
+
